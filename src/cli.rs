@@ -22,6 +22,9 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Record sanitized SubagentStop metadata for hook diagnostics.
+    #[command(hide = true)]
+    ProbeSubagent,
 }
 
 #[derive(Debug, Subcommand)]

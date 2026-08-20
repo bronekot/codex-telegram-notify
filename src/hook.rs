@@ -3,10 +3,15 @@ use crate::error::AppError;
 use crate::message::build_notification;
 use crate::telegram::{HttpTelegramApi, SendMessageRequest, TelegramApi};
 use directories::BaseDirs;
+use fs2::FileExt;
 use serde::Deserialize;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -18,8 +23,9 @@ pub struct HookPayload {
     pub model: Option<String>,
     #[serde(alias = "reasoning_effort", alias = "model_reasoning_effort")]
     pub effort: Option<String>,
-    #[allow(dead_code)]
     pub turn_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
     pub last_assistant_message: Option<String>,
 }
 
@@ -77,21 +83,105 @@ pub async fn run_hook() -> Result<(), HookFailure> {
         })
 }
 
+pub async fn run_subagent_probe() -> Result<(), AppError> {
+    let payload = read_payload().await?;
+    if payload.hook_event_name.as_deref() != Some("SubagentStop") {
+        return Ok(());
+    }
+
+    let path = subagent_probe_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::Config(format!(
+                "Unable to create hook diagnostics directory: {error}"
+            ))
+        })?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).map_err(|error| {
+        AppError::Config(format!("Unable to open hook diagnostics file: {error}"))
+    })?;
+    restrict_probe_permissions(&file)?;
+
+    let recorded_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let record = serde_json::json!({
+        "recorded_at_unix": recorded_at_unix,
+        "hook_event_name": payload.hook_event_name,
+        "session_id": payload.session_id,
+        "turn_id": payload.turn_id,
+        "agent_id": payload.agent_id,
+        "agent_type": payload.agent_type,
+        "cwd": payload.cwd.map(|path| path.to_string_lossy().into_owned()),
+        "model": payload.model,
+    });
+
+    let mut line = serde_json::to_vec(&record).map_err(|error| {
+        AppError::Config(format!("Unable to serialize hook diagnostics: {error}"))
+    })?;
+    line.push(b'\n');
+
+    file.lock_exclusive().map_err(|error| {
+        AppError::Config(format!("Unable to lock hook diagnostics file: {error}"))
+    })?;
+    let write_result = file.write_all(&line).and_then(|_| file.flush());
+    let unlock_result = file.unlock();
+
+    write_result
+        .map_err(|error| AppError::Config(format!("Unable to write hook diagnostics: {error}")))?;
+    unlock_result.map_err(|error| {
+        AppError::Config(format!("Unable to unlock hook diagnostics file: {error}"))
+    })?;
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct CodexConfig {
     model_reasoning_effort: Option<String>,
 }
 
-fn read_codex_effort() -> Option<String> {
-    let codex_home = env::var_os("CODEX_HOME")
+fn codex_home() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))?;
+        .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
+}
+
+fn read_codex_effort() -> Option<String> {
+    let codex_home = codex_home()?;
     let contents = fs::read_to_string(codex_home.join("config.toml")).ok()?;
     toml::from_str::<CodexConfig>(&contents)
         .ok()?
         .model_reasoning_effort
         .and_then(non_empty_trimmed)
+}
+
+fn subagent_probe_path() -> Result<PathBuf, AppError> {
+    codex_home()
+        .map(|path| path.join("codex-telegram-notify-subagent-events.jsonl"))
+        .ok_or_else(|| AppError::Config("Unable to determine Codex home directory".to_string()))
+}
+
+fn restrict_probe_permissions(file: &File) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                AppError::Config(format!(
+                    "Unable to restrict hook diagnostics permissions: {error}"
+                ))
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 fn non_empty_trimmed(value: String) -> Option<String> {
@@ -185,6 +275,8 @@ mod tests {
             model: None,
             effort: None,
             turn_id: Some("turn".to_string()),
+            agent_id: None,
+            agent_type: None,
             last_assistant_message: Some("Готово ✅".to_string()),
         };
 
@@ -212,6 +304,20 @@ mod tests {
         assert_eq!(payload.hook_event_name.as_deref(), Some("Stop"));
         assert_eq!(payload.last_assistant_message.as_deref(), Some("done"));
         assert_eq!(payload.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn accepts_subagent_metadata() {
+        let payload: HookPayload = serde_json::from_str(
+            r#"{
+                "hook_event_name": "SubagentStop",
+                "agent_id": "agent-123",
+                "agent_type": "review"
+            }"#,
+        )
+        .expect("payload");
+        assert_eq!(payload.agent_id.as_deref(), Some("agent-123"));
+        assert_eq!(payload.agent_type.as_deref(), Some("review"));
     }
 
     #[test]

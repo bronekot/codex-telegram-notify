@@ -24,6 +24,7 @@ async fn main() -> ExitCode {
         },
         Some(Command::Test) => run_test().await,
         Some(Command::Config { command }) => run_config(command),
+        Some(Command::ProbeSubagent) => run_subagent_probe().await,
     };
 
     match result {
@@ -44,6 +45,23 @@ async fn run_hook() -> Result<(), AppError> {
                 Ok(())
             } else {
                 Err(failure.error)
+            }
+        }
+    }
+}
+
+async fn run_subagent_probe() -> Result<(), AppError> {
+    match hook::run_subagent_probe().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let always_success = ConfigStore::discover()
+                .map(|store| store.always_success_best_effort())
+                .unwrap_or(true);
+            if always_success {
+                eprintln!("{error}");
+                Ok(())
+            } else {
+                Err(error)
             }
         }
     }

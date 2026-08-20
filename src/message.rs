@@ -77,6 +77,8 @@ mod tests {
             model: Some("gpt-5.6-sol".to_string()),
             effort: Some("high".to_string()),
             turn_id: None,
+            agent_id: None,
+            agent_type: None,
             last_assistant_message: Some("Готово 🚀".to_string()),
         }
     }

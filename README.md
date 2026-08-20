@@ -110,6 +110,12 @@ notifier falls back to `model_reasoning_effort` in
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`). Unknown payload fields
 are ignored.
 
+The hidden `probe-subagent` command is available for diagnosing
+`SubagentStop`. It records only lifecycle metadata (`agent_type`, IDs, project,
+and model) in `$CODEX_HOME/codex-telegram-notify-subagent-events.jsonl` (or
+`~/.codex/codex-telegram-notify-subagent-events.jsonl`) and never records or
+sends the assistant message.
+
 The default `always_success = true` means Telegram or configuration failures
 are logged to `stderr` but do not fail Codex's hook. Set it to `false` when
 real hook exit codes are desired:
