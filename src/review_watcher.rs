@@ -518,6 +518,17 @@ mod platform {
     use std::io::Write;
     use std::process::{Command, Output};
 
+    const PROXY_VARIABLES: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ];
+
     pub fn install(executable: &Path, codex_home: &Path) -> Result<(), AppError> {
         let path = unit_path()?;
         let parent = path.parent().ok_or_else(|| {
@@ -528,7 +539,8 @@ mod platform {
                 "Unable to create systemd user unit directory: {error}"
             ))
         })?;
-        let unit = render_unit(executable, codex_home);
+        let proxy_environment = current_proxy_environment();
+        let unit = render_unit(executable, codex_home, &proxy_environment);
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -542,7 +554,8 @@ mod platform {
         restrict_unix_permissions(&path, 0o600)?;
 
         systemctl(&["--user", "daemon-reload"])?;
-        systemctl(&["--user", "enable", "--now", SERVICE_NAME])?;
+        systemctl(&["--user", "enable", SERVICE_NAME])?;
+        systemctl(&["--user", "restart", SERVICE_NAME])?;
         println!("Daemon installed and started: {SERVICE_NAME}");
         Ok(())
     }
@@ -588,9 +601,34 @@ mod platform {
             .join(format!("{SERVICE_NAME}.service")))
     }
 
-    fn render_unit(executable: &Path, codex_home: &Path) -> String {
+    fn current_proxy_environment() -> Vec<(String, String)> {
+        PROXY_VARIABLES
+            .iter()
+            .filter_map(|name| {
+                env::var_os(name)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| ((*name).to_string(), value.to_string_lossy().into_owned()))
+            })
+            .collect()
+    }
+
+    fn render_unit(
+        executable: &Path,
+        codex_home: &Path,
+        proxy_environment: &[(String, String)],
+    ) -> String {
+        let environment = proxy_environment
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "Environment={}\n",
+                    quote_systemd_argument(&format!("{name}={value}"))
+                )
+            })
+            .collect::<String>();
         format!(
-            "[Unit]\nDescription=Codex Telegram Notify review watcher\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={} daemon run --codex-home {}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Codex Telegram Notify review watcher\nAfter=default.target\n\n[Service]\nType=simple\n{}ExecStart={} daemon run --codex-home {}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            environment,
             quote_systemd_argument(&executable.to_string_lossy()),
             quote_systemd_argument(&codex_home.to_string_lossy())
         )
@@ -642,10 +680,25 @@ mod platform {
             let unit = render_unit(
                 Path::new("/home/user/Codex Tools/codex"),
                 Path::new("/home/user/.codex"),
+                &[],
             );
             assert!(unit.contains(
                 "ExecStart=\"/home/user/Codex Tools/codex\" daemon run --codex-home \"/home/user/.codex\""
             ));
+        }
+
+        #[test]
+        fn writes_proxy_environment_to_systemd_unit() {
+            let proxy_environment = vec![(
+                "HTTPS_PROXY".to_string(),
+                "http://proxy.example:8080".to_string(),
+            )];
+            let unit = render_unit(
+                Path::new("/home/user/codex"),
+                Path::new("/home/user/.codex"),
+                &proxy_environment,
+            );
+            assert!(unit.contains("Environment=\"HTTPS_PROXY=http://proxy.example:8080\""));
         }
     }
 }

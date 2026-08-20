@@ -50,9 +50,11 @@ codex-telegram-notify daemon status
 codex-telegram-notify daemon uninstall
 ```
 
-On Linux this installs a per-user `systemd` service. On Windows it installs a
-per-user Task Scheduler task that starts at logon. The watcher reads only
-Codex session metadata and the final review result, filters
+On Linux this installs a per-user `systemd` service. Proxy variables present
+when `daemon install` runs are copied into the private service unit so the
+background process can use the same Telegram network route as the CLI. On
+Windows it installs a per-user Task Scheduler task that starts at logon. The
+watcher reads only Codex session metadata and the final review result, filters
 `source.subagent = "review"`, and stores offsets/deduplication state in the
 application configuration directory. The first daemon start ignores reviews
 that had already completed; new reviews are notified once.
