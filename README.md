@@ -1,8 +1,9 @@
 # codex-telegram-notify
 
-Small Rust CLI that sends a Telegram notification when a Codex `Stop` hook
-finishes the main agent turn. It does not configure `SubagentStop`, tool hooks,
-or file-change hooks.
+Small Rust CLI that sends Telegram notifications when a Codex `Stop` hook
+finishes the main agent turn and when a Codex `/review` session completes.
+Review completion is watched from Codex's local session JSONL files because
+`/review` is a dedicated review session rather than a `SubagentStop` hook.
 
 ## Install
 
@@ -40,11 +41,33 @@ timeout = 10
 Only `Stop` should be configured for this notifier. Do not add
 `SubagentStop`, `PreToolUse`, or `PostToolUse` entries for it.
 
+Install the review watcher separately. It does not change how Codex is started
+or how `/review` is invoked:
+
+```text
+codex-telegram-notify daemon install
+codex-telegram-notify daemon status
+codex-telegram-notify daemon uninstall
+```
+
+On Linux this installs a per-user `systemd` service. On Windows it installs a
+per-user Task Scheduler task that starts at logon. The watcher reads only
+Codex session metadata and the final review result, filters
+`source.subagent = "review"`, and stores offsets/deduplication state in the
+application configuration directory. The first daemon start ignores reviews
+that had already completed; new reviews are notified once.
+
+The daemon uses the saved configuration from `setup`. Do not rely only on
+temporary shell environment variables for its bot token or chat ID.
+
 ## Commands
 
 ```text
 codex-telegram-notify setup
 codex-telegram-notify test
+codex-telegram-notify daemon install
+codex-telegram-notify daemon status
+codex-telegram-notify daemon uninstall
 
 codex-telegram-notify config show
 codex-telegram-notify config get chat-id
@@ -110,11 +133,12 @@ notifier falls back to `model_reasoning_effort` in
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`). Unknown payload fields
 are ignored.
 
-The hidden `probe-subagent` command is available for diagnosing
-`SubagentStop`. It records only lifecycle metadata (`agent_type`, IDs, project,
-and model) in `$CODEX_HOME/codex-telegram-notify-subagent-events.jsonl` (or
+The hidden `probe-subagent` command is available for diagnosing actual
+`SubagentStop` events. It records only lifecycle metadata (`agent_type`, IDs,
+project, and model) in
+`$CODEX_HOME/codex-telegram-notify-subagent-events.jsonl` (or
 `~/.codex/codex-telegram-notify-subagent-events.jsonl`) and never records or
-sends the assistant message.
+sends the assistant message. It is not used to detect `/review` completion.
 
 The default `always_success = true` means Telegram or configuration failures
 are logged to `stderr` but do not fail Codex's hook. Set it to `false` when

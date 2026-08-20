@@ -2,10 +2,8 @@ use crate::config::{ConfigStore, RuntimeConfig};
 use crate::error::AppError;
 use crate::message::build_notification;
 use crate::telegram::{HttpTelegramApi, SendMessageRequest, TelegramApi};
-use directories::BaseDirs;
 use fs2::FileExt;
 use serde::Deserialize;
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -147,15 +145,8 @@ struct CodexConfig {
     model_reasoning_effort: Option<String>,
 }
 
-fn codex_home() -> Option<PathBuf> {
-    env::var_os("CODEX_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
-}
-
 fn read_codex_effort() -> Option<String> {
-    let codex_home = codex_home()?;
+    let codex_home = crate::paths::codex_home()?;
     let contents = fs::read_to_string(codex_home.join("config.toml")).ok()?;
     toml::from_str::<CodexConfig>(&contents)
         .ok()?
@@ -164,7 +155,7 @@ fn read_codex_effort() -> Option<String> {
 }
 
 fn subagent_probe_path() -> Result<PathBuf, AppError> {
-    codex_home()
+    crate::paths::codex_home()
         .map(|path| path.join("codex-telegram-notify-subagent-events.jsonl"))
         .ok_or_else(|| AppError::Config("Unable to determine Codex home directory".to_string()))
 }

@@ -1,10 +1,11 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "codex-telegram-notify",
     version,
-    about = "Send Codex Stop hook notifications to Telegram"
+    about = "Send Codex turn and review notifications to Telegram"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,6 +26,28 @@ pub enum Command {
     /// Record sanitized SubagentStop metadata for hook diagnostics.
     #[command(hide = true)]
     ProbeSubagent,
+    /// Install and control the background review watcher.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Install and start the per-user background watcher.
+    Install,
+    /// Stop and remove the per-user background watcher.
+    Uninstall,
+    /// Show the per-user background watcher status.
+    Status,
+    /// Run the watcher process. Used by the installed service.
+    #[command(hide = true)]
+    Run {
+        /// Explicit Codex home captured by `daemon install`.
+        #[arg(long, value_name = "PATH")]
+        codex_home: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

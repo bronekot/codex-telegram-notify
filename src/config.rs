@@ -149,6 +149,12 @@ impl ConfigStore {
         Self { path: path.into() }
     }
 
+    pub fn config_dir(&self) -> Result<PathBuf, AppError> {
+        self.path.parent().map(Path::to_path_buf).ok_or_else(|| {
+            AppError::Config("Unable to determine the configuration directory".to_string())
+        })
+    }
+
     #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path

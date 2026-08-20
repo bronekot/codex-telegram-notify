@@ -3,11 +3,13 @@ mod config;
 mod error;
 mod hook;
 mod message;
+mod paths;
+mod review_watcher;
 mod setup;
 mod telegram;
 
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand};
+use cli::{Cli, Command, ConfigCommand, DaemonCommand};
 use config::{format_get, format_show, set_value, ConfigStore};
 use error::AppError;
 use std::process::ExitCode;
@@ -25,6 +27,7 @@ async fn main() -> ExitCode {
         Some(Command::Test) => run_test().await,
         Some(Command::Config { command }) => run_config(command),
         Some(Command::ProbeSubagent) => run_subagent_probe().await,
+        Some(Command::Daemon { command }) => run_daemon(command).await,
     };
 
     match result {
@@ -64,6 +67,15 @@ async fn run_subagent_probe() -> Result<(), AppError> {
                 Err(error)
             }
         }
+    }
+}
+
+async fn run_daemon(command: DaemonCommand) -> Result<(), AppError> {
+    match command {
+        DaemonCommand::Install => review_watcher::install_daemon(),
+        DaemonCommand::Uninstall => review_watcher::uninstall_daemon(),
+        DaemonCommand::Status => review_watcher::daemon_status(),
+        DaemonCommand::Run { codex_home } => review_watcher::run(codex_home).await,
     }
 }
 

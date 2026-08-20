@@ -41,6 +41,42 @@ pub fn build_notification(payload: &HookPayload, max_length: usize) -> String {
     truncate_unicode(&output, max_length)
 }
 
+pub fn build_review_notification(
+    cwd: Option<&Path>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    findings: Option<usize>,
+    explanation: Option<&str>,
+    max_length: usize,
+) -> String {
+    let project = cwd
+        .and_then(project_name)
+        .unwrap_or_else(|| UNKNOWN_PROJECT.to_string());
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    let effort = effort.map(str::trim).filter(|value| !value.is_empty());
+
+    let mut output = format!("🔎 Codex завершил review\n\n📁 {project}\n");
+    if let Some(model) = model {
+        output.push_str(&format!("🤖 {model}"));
+        if let Some(effort) = effort {
+            output.push_str(&format!(" ({effort})"));
+        }
+        output.push('\n');
+    }
+
+    match findings {
+        Some(0) => output.push_str("\n✅ Замечаний не найдено."),
+        Some(count) => output.push_str(&format!("\n⚠️ Найдено замечаний: {count}.")),
+        None => output.push_str("\n✅ Результат ревью получен."),
+    }
+    if let Some(explanation) = explanation.map(str::trim).filter(|value| !value.is_empty()) {
+        output.push_str("\n\n");
+        output.push_str(explanation);
+    }
+
+    truncate_unicode(&output, max_length)
+}
+
 fn project_name(path: &Path) -> Option<String> {
     path.file_name()
         .map(|name| name.to_string_lossy().trim().to_string())
@@ -89,6 +125,22 @@ mod tests {
         assert!(result.contains("📁 моя-папка"));
         assert!(result.contains("🤖 gpt-5.6-sol (high)"));
         assert!(result.contains("Готово 🚀"));
+    }
+
+    #[test]
+    fn formats_review_without_findings() {
+        let result = build_review_notification(
+            Some(Path::new("/home/user/project")),
+            Some("gpt-5.6-luna"),
+            Some("max"),
+            Some(0),
+            Some("Изменения выглядят корректно."),
+            3500,
+        );
+        assert!(result.contains("завершил review"));
+        assert!(result.contains("🤖 gpt-5.6-luna (max)"));
+        assert!(result.contains("Замечаний не найдено"));
+        assert!(result.contains("Изменения выглядят корректно"));
     }
 
     #[test]
