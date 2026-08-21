@@ -26,8 +26,17 @@ the configuration. If messages arrive from more than one chat, setup displays
 the candidates and asks for a number. Press `Ctrl+C` to cancel; setup waits no
 longer than five minutes.
 
-The setup command does not edit Codex configuration. Add the `Stop` hook to the
-Codex config layer you use, then review/trust it in Codex with `/hooks`:
+The setup command does not edit Codex configuration. Install the `Stop` hook
+automatically with:
+
+```text
+codex-telegram-notify install-hook
+```
+
+The command uses `CODEX_HOME` when it is set, otherwise the user's `.codex`
+directory. It checks for an existing hook, appends the new block after the
+complete TOML file, and creates a `config.toml.codex-telegram-notify.bak`
+backup before changing an existing file. The resulting block is:
 
 ```toml
 [[hooks.Stop]]
@@ -50,11 +59,12 @@ codex-telegram-notify daemon status
 codex-telegram-notify daemon uninstall
 ```
 
-On Linux this installs a per-user `systemd` service. Proxy variables present
-when `daemon install` runs are copied into the private service unit so the
-background process can use the same Telegram network route as the CLI. On
-Windows it installs a per-user Task Scheduler task that starts at logon. The
-watcher reads only Codex session metadata and the final review result, filters
+On Linux this installs a per-user `systemd` service. On Windows it installs a
+per-user Task Scheduler task that starts at logon. Proxy variables present
+when `daemon install` runs are copied into the service configuration (or a
+private Windows launcher) so the background process can use the same Telegram
+network route as the CLI. Re-run `daemon install` after changing proxy
+variables. The watcher reads only Codex session metadata and the final review result, filters
 `source.subagent = "review"`, and stores offsets/deduplication state in the
 application configuration directory. The first daemon start ignores reviews
 that had already completed; new reviews are notified once.
@@ -62,11 +72,17 @@ that had already completed; new reviews are notified once.
 The daemon uses the saved configuration from `setup`. Do not rely only on
 temporary shell environment variables for its bot token or chat ID.
 
+The Telegram client uses the Windows system proxy and the standard
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables. HTTP(S) and
+SOCKS5 proxy URLs are supported, for example `HTTPS_PROXY=http://127.0.0.1:7890`
+or `ALL_PROXY=socks5://127.0.0.1:1080`.
+
 ## Commands
 
 ```text
 codex-telegram-notify setup
 codex-telegram-notify test
+codex-telegram-notify install-hook
 codex-telegram-notify daemon install
 codex-telegram-notify daemon status
 codex-telegram-notify daemon uninstall

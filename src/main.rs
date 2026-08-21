@@ -1,4 +1,5 @@
 mod cli;
+mod codex_hook;
 mod config;
 mod error;
 mod hook;
@@ -25,6 +26,7 @@ async fn main() -> ExitCode {
             Err(error) => Err(error),
         },
         Some(Command::Test) => run_test().await,
+        Some(Command::InstallHook) => codex_hook::install(),
         Some(Command::Config { command }) => run_config(command),
         Some(Command::ProbeSubagent) => run_subagent_probe().await,
         Some(Command::Daemon { command }) => run_daemon(command).await,

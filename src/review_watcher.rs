@@ -705,20 +705,44 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::{AppError, Path, SERVICE_NAME};
+    use super::{AppError, ConfigStore, Path, PathBuf, SERVICE_NAME};
+    use std::env;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::process::{Command, Output};
 
+    const PROXY_VARIABLES: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ];
     const TASK_NAME: &str = "Codex Telegram Notify Review Watcher";
+    const LAUNCHER_FILE_NAME: &str = "review-watcher.vbs";
+    const LEGACY_LAUNCHER_FILE_NAME: &str = "review-watcher.ps1";
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     pub fn install(executable: &Path, codex_home: &Path) -> Result<(), AppError> {
-        let action = format!(
-            "\"{}\" daemon run --codex-home \"{}\"",
-            executable.display(),
-            codex_home.display()
-        );
+        let launcher_path = launcher_path()?;
+        let proxy_environment = current_proxy_environment();
+        write_launcher(
+            &launcher_path,
+            &render_launcher(executable, codex_home, &proxy_environment),
+        )?;
+        let action = task_action(&launcher_path);
         let output = schtasks(&[
             "/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/TR", &action, "/RL", "LIMITED", "/F",
         ])?;
+        if !output.status.success() && is_access_denied(&output) && task_exists() {
+            let output = schtasks(&["/Run", "/TN", TASK_NAME])?;
+            ensure_success("schtasks", &output)?;
+            println!("Daemon launcher updated and existing task started: {SERVICE_NAME}");
+            return Ok(());
+        }
         ensure_success("schtasks", &output)?;
         let output = schtasks(&["/Run", "/TN", TASK_NAME])?;
         ensure_success("schtasks", &output)?;
@@ -735,6 +759,18 @@ mod platform {
         let _ = schtasks(&["/End", "/TN", TASK_NAME]);
         let output = schtasks(&["/Delete", "/TN", TASK_NAME, "/F"])?;
         ensure_success("schtasks", &output)?;
+        let launcher_path = launcher_path()?;
+        if launcher_path.exists() {
+            fs::remove_file(&launcher_path).map_err(|error| {
+                AppError::Config(format!("Unable to remove Windows daemon launcher: {error}"))
+            })?;
+        }
+        let legacy_launcher_path = launcher_path.with_file_name(LEGACY_LAUNCHER_FILE_NAME);
+        if legacy_launcher_path.exists() {
+            fs::remove_file(&legacy_launcher_path).map_err(|error| {
+                AppError::Config(format!("Unable to remove Windows daemon launcher: {error}"))
+            })?;
+        }
         println!("Daemon uninstalled: {SERVICE_NAME}");
         Ok(())
     }
@@ -745,25 +781,216 @@ mod platform {
             println!("Daemon is not installed.");
             return Ok(());
         }
-        print!("{}", String::from_utf8_lossy(&output.stdout));
+        print!("{}", decode_windows_output(&output.stdout));
         Ok(())
     }
 
+    fn task_action(launcher_path: &Path) -> String {
+        format!("wscript.exe //B //NoLogo \"{}\"", launcher_path.display())
+    }
+
+    fn task_exists() -> bool {
+        schtasks(&["/Query", "/TN", TASK_NAME, "/FO", "LIST"])
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn is_access_denied(output: &Output) -> bool {
+        let message = format!(
+            "{} {}",
+            decode_windows_output(&output.stdout),
+            decode_windows_output(&output.stderr)
+        )
+        .to_lowercase();
+        message.contains("access is denied") || message.contains("отказано в доступе")
+    }
+
     fn schtasks(args: &[&str]) -> Result<Output, AppError> {
+        use std::os::windows::process::CommandExt;
+
         Command::new("schtasks.exe")
             .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|error| AppError::Config(format!("Unable to run schtasks: {error}")))
+    }
+
+    fn launcher_path() -> Result<PathBuf, AppError> {
+        Ok(ConfigStore::discover()?
+            .config_dir()?
+            .join(LAUNCHER_FILE_NAME))
+    }
+
+    fn current_proxy_environment() -> Vec<(String, String)> {
+        PROXY_VARIABLES
+            .iter()
+            .filter_map(|name| {
+                env::var_os(name)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| ((*name).to_string(), value.to_string_lossy().into_owned()))
+            })
+            .collect()
+    }
+
+    fn write_launcher(path: &Path, contents: &str) -> Result<(), AppError> {
+        let parent = path.parent().ok_or_else(|| {
+            AppError::Config("Unable to determine Windows daemon launcher directory".to_string())
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::Config(format!(
+                "Unable to create Windows daemon launcher directory: {error}"
+            ))
+        })?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| {
+                AppError::Config(format!("Unable to write Windows daemon launcher: {error}"))
+            })?;
+        let mut encoded = Vec::with_capacity(contents.len() * 2 + 2);
+        for unit in contents.encode_utf16() {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+        file.write_all(b"\xFF\xFE")
+            .and_then(|_| file.write_all(&encoded))
+            .and_then(|_| file.sync_all())
+            .map_err(|error| {
+                AppError::Config(format!("Unable to save Windows daemon launcher: {error}"))
+            })?;
+        Ok(())
+    }
+
+    fn render_launcher(
+        executable: &Path,
+        codex_home: &Path,
+        proxy_environment: &[(String, String)],
+    ) -> String {
+        let mut script = String::from("Option Explicit\r\n");
+        script.push_str("Dim shell, environment\r\n");
+        script.push_str("Set shell = CreateObject(\"WScript.Shell\")\r\n");
+        script.push_str("Set environment = shell.Environment(\"Process\")\r\n");
+        for (name, value) in proxy_environment {
+            script.push_str("environment(");
+            script.push_str(&quote_vbscript_string(name));
+            script.push_str(") = ");
+            script.push_str(&quote_vbscript_string(value));
+            script.push_str("\r\n");
+        }
+        let command = format!(
+            "\"{}\" daemon run --codex-home \"{}\"",
+            executable.display(),
+            codex_home.display()
+        );
+        script.push_str("shell.Run ");
+        script.push_str(&quote_vbscript_string(&command));
+        script.push_str(", 0, True\r\n");
+        script
+    }
+
+    fn quote_vbscript_string(value: &str) -> String {
+        format!("\"{}\"", value.replace('"', "\"\""))
     }
 
     fn ensure_success(command: &str, output: &Output) -> Result<(), AppError> {
         if output.status.success() {
             return Ok(());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = decode_windows_output(&output.stderr).trim().to_string();
+        let stdout = decode_windows_output(&output.stdout).trim().to_string();
         let message = if !stderr.is_empty() { stderr } else { stdout };
         Err(AppError::Config(format!("{command} failed: {message}")))
+    }
+
+    fn decode_windows_output(bytes: &[u8]) -> String {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return text.to_string();
+        }
+        if bytes.is_empty() {
+            return String::new();
+        }
+
+        let byte_count = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
+        let code_page = unsafe { get_oem_cp() };
+        let wide_count = unsafe {
+            multi_byte_to_wide_char(
+                code_page,
+                0,
+                bytes.as_ptr() as *const i8,
+                byte_count,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if wide_count <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+
+        let mut wide = vec![0u16; wide_count as usize];
+        let converted = unsafe {
+            multi_byte_to_wide_char(
+                code_page,
+                0,
+                bytes.as_ptr() as *const i8,
+                byte_count,
+                wide.as_mut_ptr(),
+                wide_count,
+            )
+        };
+        if converted <= 0 {
+            String::from_utf8_lossy(bytes).into_owned()
+        } else {
+            String::from_utf16_lossy(&wide[..converted as usize])
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "GetOEMCP"]
+        fn get_oem_cp() -> u32;
+        #[link_name = "MultiByteToWideChar"]
+        fn multi_byte_to_wide_char(
+            code_page: u32,
+            flags: u32,
+            input: *const i8,
+            input_length: i32,
+            output: *mut u16,
+            output_length: i32,
+        ) -> i32;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn launcher_sets_proxy_and_quotes_paths() {
+            let script = render_launcher(
+                Path::new(r"C:\Users\Brone Kot\codex-telegram-notify.exe"),
+                Path::new(r"C:\Users\Brone Kot\.codex"),
+                &[(
+                    "HTTPS_PROXY".to_string(),
+                    "http://user:p'ass@proxy.example:8080".to_string(),
+                )],
+            );
+            assert!(script.contains(
+                "environment(\"HTTPS_PROXY\") = \"http://user:p'ass@proxy.example:8080\""
+            ));
+            assert!(script.contains("shell.Run "));
+            assert!(script.contains(r#"C:\Users\Brone Kot\codex-telegram-notify.exe"#));
+            assert!(script.contains(r#"C:\Users\Brone Kot\.codex"#));
+            assert!(script.contains(", 0, True"));
+        }
+
+        #[test]
+        fn launcher_action_uses_hidden_windows_script_host() {
+            let action = task_action(Path::new(r"C:\Users\Brone Kot\.codex\review-watcher.ps1"));
+            assert_eq!(
+                action,
+                r#"wscript.exe //B //NoLogo "C:\Users\Brone Kot\.codex\review-watcher.ps1""#
+            );
+        }
     }
 }
 

@@ -18,6 +18,8 @@ pub enum Command {
     Setup,
     /// Send a test notification using the saved configuration.
     Test,
+    /// Install the Codex Stop hook in the user's Codex configuration.
+    InstallHook,
     /// Inspect or change the saved configuration.
     Config {
         #[command(subcommand)]
