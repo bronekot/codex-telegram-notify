@@ -92,7 +92,7 @@ async fn run_test() -> Result<(), AppError> {
         .map_err(|error| AppError::Telegram(error.user_message()))?;
     api.send_message(telegram::SendMessageRequest {
         chat_id: runtime.chat_id,
-        text: "🧪 Codex Telegram Notify\n\nТестовое уведомление успешно отправлено.".to_string(),
+        text: "🧪 Codex Telegram Notify\n\nТестовое уведомление отправлено.".to_string(),
         disable_notification: runtime.silent,
     })
     .await

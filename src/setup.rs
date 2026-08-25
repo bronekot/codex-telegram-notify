@@ -13,7 +13,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPDATE_TIMEOUT_SECONDS: u64 = 15;
 const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(25);
 const CHAT_COLLECTION_WINDOW: Duration = Duration::from_secs(2);
-const TEST_MESSAGE: &str = "🧪 Codex Telegram Notify\n\nТестовое уведомление успешно отправлено.";
+const TEST_MESSAGE: &str = "🧪 Codex Telegram Notify\n\nТестовое уведомление отправлено.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatCandidate {
@@ -44,10 +44,10 @@ pub async fn run_setup_with_api(
     api: &dyn TelegramApi,
 ) -> Result<(), AppError> {
     let bot = await_api(api.get_me()).await?;
-    println!("✓ Бот найден: {}", bot_display_name(&bot));
+    println!("✓ Бот доступен: {}", bot_display_name(&bot));
     println!();
     println!("Откройте бота в Telegram и отправьте ему /start.");
-    println!("Ожидание сообщения...");
+    println!("Ожидаю сообщение…");
     println!();
 
     let baseline_updates = await_api(api.get_updates(GetUpdatesRequest {
@@ -258,7 +258,7 @@ async fn choose_candidate(
         return Ok(candidates[0].clone());
     }
 
-    println!("Обнаружено несколько чатов:");
+    println!("Найдено несколько чатов:");
     for (index, candidate) in candidates.iter().enumerate() {
         println!(
             "{}. {} — {} — {}",
@@ -272,7 +272,7 @@ async fn choose_candidate(
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     loop {
-        print!("Выберите чат: ");
+        print!("Выберите чат из списка: ");
         std::io::stdout()
             .flush()
             .map_err(|_| AppError::Config("Unable to write setup prompt".to_string()))?;
