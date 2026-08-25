@@ -129,9 +129,13 @@ supergroup IDs are supported.
 
 With no command-line arguments, the binary reads the Codex hook JSON from
 stdin. It uses `cwd`, `model`, `effort`, and `last_assistant_message` to produce
-a plain text Telegram message without Markdown or HTML parsing. When the
-current Codex version does not include `effort` in the hook payload, the
-notifier falls back to `model_reasoning_effort` in
+a plain text Telegram message without Markdown or HTML parsing. The assistant
+message may be ordinary text, a JSON string, or a JSON object: the notifier
+extracts the answer from common `answer`, `response`, `message`, `text`,
+`output_text`, and `content` envelopes. Review-shaped JSON is formatted with
+its findings and overall explanation instead of being sent as a raw JSON blob.
+When the current Codex version does not include `effort` in the hook payload,
+the notifier falls back to `model_reasoning_effort` in
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`). Unknown payload fields
 are ignored.
 

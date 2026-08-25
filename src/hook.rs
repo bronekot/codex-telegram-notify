@@ -3,7 +3,8 @@ use crate::error::AppError;
 use crate::message::build_notification;
 use crate::telegram::{HttpTelegramApi, SendMessageRequest, TelegramApi};
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
+use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
@@ -24,7 +25,22 @@ pub struct HookPayload {
     pub turn_id: Option<String>,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_assistant_message")]
     pub last_assistant_message: Option<String>,
+}
+
+fn deserialize_assistant_message<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Value>::deserialize(deserializer)?
+        .map(|value| match value {
+            Value::String(value) => Ok(value),
+            value => {
+                serde_json::to_string(&value).map_err(|error| de::Error::custom(error.to_string()))
+            }
+        })
+        .transpose()
 }
 
 pub struct HookFailure {
@@ -295,6 +311,21 @@ mod tests {
         assert_eq!(payload.hook_event_name.as_deref(), Some("Stop"));
         assert_eq!(payload.last_assistant_message.as_deref(), Some("done"));
         assert_eq!(payload.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn accepts_object_as_last_assistant_message() {
+        let payload: HookPayload = serde_json::from_str(
+            r#"{
+                "hook_event_name": "Stop",
+                "last_assistant_message": {"answer": "done"}
+            }"#,
+        )
+        .expect("payload");
+        assert_eq!(
+            payload.last_assistant_message.as_deref(),
+            Some(r#"{"answer":"done"}"#)
+        );
     }
 
     #[test]
