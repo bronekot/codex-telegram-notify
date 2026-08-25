@@ -24,7 +24,24 @@ struct ReviewSummary {
     model: Option<String>,
     effort: Option<String>,
     findings: Option<usize>,
+    #[serde(default)]
+    finding_details: Vec<ReviewFinding>,
     explanation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ReviewFinding {
+    title: Option<String>,
+    body: Option<String>,
+    priority: Option<u8>,
+    code_location: Option<ReviewCodeLocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ReviewCodeLocation {
+    absolute_file_path: Option<String>,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -36,6 +53,8 @@ struct SessionFileState {
     cwd: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    #[serde(default)]
+    last_agent_message: Option<String>,
     completion: Option<ReviewSummary>,
     notified: bool,
 }
@@ -78,13 +97,8 @@ struct EventMessagePayload {
     #[serde(rename = "type")]
     event_type: Option<String>,
     turn_id: Option<String>,
-    last_agent_message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReviewResult {
-    findings: Option<Vec<Value>>,
-    overall_explanation: Option<String>,
+    last_agent_message: Option<Value>,
+    message: Option<Value>,
 }
 
 pub async fn run(codex_home_override: Option<PathBuf>) -> Result<(), AppError> {
@@ -301,14 +315,27 @@ async fn notify_review_with_api(
     config: &RuntimeConfig,
     api: &dyn TelegramApi,
 ) -> Result<(), AppError> {
-    let text = build_review_notification(
-        summary.cwd.as_deref().map(Path::new),
-        summary.model.as_deref(),
-        summary.effort.as_deref(),
-        summary.findings,
-        summary.explanation.as_deref(),
-        config.max_length,
-    );
+    let findings = format_review_findings(&summary.finding_details);
+    let text = if findings.is_some() {
+        crate::message::build_review_notification_with_findings(
+            summary.cwd.as_deref().map(Path::new),
+            summary.model.as_deref(),
+            summary.effort.as_deref(),
+            summary.findings,
+            findings.as_deref(),
+            summary.explanation.as_deref(),
+            config.max_length,
+        )
+    } else {
+        build_review_notification(
+            summary.cwd.as_deref().map(Path::new),
+            summary.model.as_deref(),
+            summary.effort.as_deref(),
+            summary.findings,
+            summary.explanation.as_deref(),
+            config.max_length,
+        )
+    };
     api.send_message(SendMessageRequest {
         chat_id: config.chat_id,
         text,
@@ -351,25 +378,51 @@ fn apply_record(state: &mut SessionFileState, record: SessionRecord) {
             state.model = context.model.or_else(|| state.model.take());
             state.effort = context.effort.or_else(|| state.effort.take());
         }
-        "event_msg" if state.is_review => {
-            let Ok(event) = serde_json::from_value::<EventMessagePayload>(payload) else {
-                return;
-            };
-            if event.event_type.as_deref() != Some("task_complete") || state.completion.is_some() {
-                return;
+        "event_msg" if state.is_review => apply_event_message(state, payload),
+        "response_item" if state.is_review => {
+            if let Some(message) = extract_assistant_message(&payload) {
+                state.last_agent_message = Some(message);
             }
+        }
+        _ => {}
+    }
+}
+
+fn apply_event_message(state: &mut SessionFileState, payload: Value) {
+    let Ok(event) = serde_json::from_value::<EventMessagePayload>(payload) else {
+        return;
+    };
+
+    match event.event_type.as_deref() {
+        Some("agent_message") => {
+            if let Some(message) = event
+                .message
+                .as_ref()
+                .or(event.last_agent_message.as_ref())
+                .and_then(value_to_message)
+            {
+                state.last_agent_message = Some(message);
+            }
+        }
+        Some("task_complete") if state.completion.is_none() => {
+            let message = event
+                .last_agent_message
+                .as_ref()
+                .and_then(value_to_message)
+                .or_else(|| state.last_agent_message.clone());
             let review_id = state
                 .review_id
                 .clone()
                 .or(event.turn_id)
                 .unwrap_or_else(|| "unknown-review".to_string());
-            let (findings, explanation) = summarize_review(event.last_agent_message.as_deref());
+            let (findings, finding_details, explanation) = summarize_review(message.as_deref());
             state.completion = Some(ReviewSummary {
                 review_id,
                 cwd: state.cwd.clone(),
                 model: state.model.clone(),
                 effort: state.effort.clone(),
                 findings,
+                finding_details,
                 explanation,
             });
         }
@@ -377,22 +430,202 @@ fn apply_record(state: &mut SessionFileState, record: SessionRecord) {
     }
 }
 
-fn summarize_review(message: Option<&str>) -> (Option<usize>, Option<String>) {
+fn summarize_review(message: Option<&str>) -> (Option<usize>, Vec<ReviewFinding>, Option<String>) {
     let Some(message) = message.map(str::trim).filter(|value| !value.is_empty()) else {
-        return (None, None);
+        return (None, Vec::new(), None);
     };
-    if let Ok(result) = serde_json::from_str::<ReviewResult>(message) {
-        return (
-            result.findings.map(|findings| findings.len()),
-            result.overall_explanation.and_then(normalize_explanation),
-        );
+
+    if let Some(value) = parse_json_answer(message) {
+        if let Some(object) = value.as_object() {
+            let finding_values = object.get("findings").and_then(Value::as_array);
+            let finding_details = finding_values
+                .into_iter()
+                .flatten()
+                .filter_map(parse_review_finding)
+                .collect::<Vec<_>>();
+            let explanation = object
+                .get("overall_explanation")
+                .and_then(value_to_message)
+                .and_then(normalize_explanation);
+
+            if object.contains_key("findings") || explanation.is_some() {
+                return (finding_values.map(Vec::len), finding_details, explanation);
+            }
+        }
+
+        if let Some(answer) = value_to_message(&value) {
+            return (None, Vec::new(), normalize_explanation(answer));
+        }
+        return (None, Vec::new(), None);
     }
-    (None, Some(truncate_unicode(message, 1000)))
+
+    if looks_like_json(message) {
+        return (None, Vec::new(), None);
+    }
+    (None, Vec::new(), Some(truncate_unicode(message, 1000)))
 }
 
 fn normalize_explanation(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then(|| truncate_unicode(&value, 1000))
+}
+
+fn parse_json_answer(message: &str) -> Option<Value> {
+    let candidates = [
+        message,
+        message
+            .strip_prefix("```json")
+            .and_then(|value| value.strip_suffix("```"))
+            .map(str::trim)
+            .unwrap_or(message),
+    ];
+
+    for candidate in candidates {
+        if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+            return Some(value);
+        }
+    }
+
+    for (opening, closing) in [(b'{', b'}'), (b'[', b']')] {
+        let Some(start) = message.as_bytes().iter().position(|byte| *byte == opening) else {
+            continue;
+        };
+        let Some(end) = message.as_bytes().iter().rposition(|byte| *byte == closing) else {
+            continue;
+        };
+        if start <= end {
+            if let Ok(value) = serde_json::from_str::<Value>(&message[start..=end]) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_json(message: &str) -> bool {
+    message.starts_with('{')
+        || message.starts_with('[')
+        || message.starts_with("```json")
+        || message.starts_with("```")
+}
+
+fn value_to_message(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => non_empty_message(value),
+        Value::Array(values) => {
+            let messages = values
+                .iter()
+                .filter_map(value_to_message)
+                .collect::<Vec<_>>();
+            (!messages.is_empty()).then(|| messages.join("\n"))
+        }
+        Value::Object(object) => {
+            for key in ["text", "message", "output_text", "content"] {
+                if let Some(value) = object.get(key).and_then(value_to_message) {
+                    return Some(value);
+                }
+            }
+            serde_json::to_string(value).ok()
+        }
+        _ => None,
+    }
+}
+
+fn non_empty_message(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn extract_assistant_message(payload: &Value) -> Option<String> {
+    let object = payload.as_object()?;
+    if object.get("type").and_then(Value::as_str) != Some("message")
+        || object.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return None;
+    }
+    object.get("content").and_then(value_to_message)
+}
+
+fn parse_review_finding(value: &Value) -> Option<ReviewFinding> {
+    let object = value.as_object()?;
+    let title = object
+        .get("title")
+        .and_then(Value::as_str)
+        .and_then(non_empty_message);
+    let body = object
+        .get("body")
+        .and_then(Value::as_str)
+        .and_then(non_empty_message);
+    let priority = object
+        .get("priority")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok());
+    let code_location = object
+        .get("code_location")
+        .and_then(Value::as_object)
+        .map(parse_code_location);
+
+    (title.is_some() || body.is_some() || code_location.is_some()).then_some(ReviewFinding {
+        title,
+        body,
+        priority,
+        code_location,
+    })
+}
+
+fn parse_code_location(object: &serde_json::Map<String, Value>) -> ReviewCodeLocation {
+    let line_range = object.get("line_range").and_then(Value::as_object);
+    ReviewCodeLocation {
+        absolute_file_path: object
+            .get("absolute_file_path")
+            .and_then(Value::as_str)
+            .and_then(non_empty_message),
+        start_line: line_range
+            .and_then(|range| range.get("start"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        end_line: line_range
+            .and_then(|range| range.get("end"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+    }
+}
+
+fn format_review_findings(findings: &[ReviewFinding]) -> Option<String> {
+    if findings.is_empty() {
+        return None;
+    }
+
+    let mut output = String::new();
+    for (index, finding) in findings.iter().enumerate() {
+        if index > 0 {
+            output.push_str("\n\n");
+        }
+        output.push_str(&format!("{}. ", index + 1));
+        if finding.title.is_none() {
+            if let Some(priority) = finding.priority {
+                output.push_str(&format!("[P{priority}] "));
+            }
+        }
+        output.push_str(finding.title.as_deref().unwrap_or("Замечание"));
+        if let Some(body) = finding.body.as_deref() {
+            output.push('\n');
+            output.push_str(body);
+        }
+        if let Some(location) = finding.code_location.as_ref() {
+            if let Some(path) = location.absolute_file_path.as_deref() {
+                output.push_str("\n📍 ");
+                output.push_str(path);
+                if let Some(start) = location.start_line {
+                    output.push_str(&format!(":{start}"));
+                    if location.end_line.is_some_and(|end| end != start) {
+                        output.push_str(&format!("-{}", location.end_line.unwrap_or(start)));
+                    }
+                }
+            }
+        }
+    }
+    Some(output)
 }
 
 fn discover_session_files(root: &Path) -> io::Result<Vec<PathBuf>> {
@@ -901,6 +1134,132 @@ mod tests {
         let pending = watcher.scan_once(false).expect("complete scan");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].findings, Some(1));
+    }
+
+    #[test]
+    fn extracts_findings_from_json_and_keeps_plain_answers_readable() {
+        let message = r#"{
+            "findings": [{
+                "title": "[P1] Исправить разбор ответа",
+                "body": "Тело проблемы должно попасть в уведомление.",
+                "priority": 1,
+                "code_location": {
+                    "absolute_file_path": "/home/user/project/src/lib.rs",
+                    "line_range": {"start": 12, "end": 14}
+                }
+            }],
+            "overall_explanation": "Патч требует доработки."
+        }"#;
+
+        let (findings, details, explanation) = summarize_review(Some(message));
+        assert_eq!(findings, Some(1));
+        assert_eq!(details.len(), 1);
+        assert_eq!(
+            details[0].body.as_deref(),
+            Some("Тело проблемы должно попасть в уведомление.")
+        );
+        assert_eq!(
+            format_review_findings(&details).as_deref(),
+            Some(
+                "1. [P1] Исправить разбор ответа\nТело проблемы должно попасть в уведомление.\n📍 /home/user/project/src/lib.rs:12-14"
+            )
+        );
+        assert_eq!(explanation.as_deref(), Some("Патч требует доработки."));
+
+        let fenced = format!("```json\n{message}\n```");
+        let (_, fenced_details, _) = summarize_review(Some(&fenced));
+        assert_eq!(fenced_details, details);
+
+        let (_, no_details, plain_answer) = summarize_review(Some("Проверка завершена без JSON."));
+        assert!(no_details.is_empty());
+        assert_eq!(
+            plain_answer.as_deref(),
+            Some("Проверка завершена без JSON.")
+        );
+    }
+
+    #[test]
+    fn accepts_agent_message_and_response_item_answer_formats() {
+        let directory = tempdir().expect("tempdir");
+        let sessions = directory.path().join("sessions/2026/08/20");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let path = sessions.join("rollout-review.jsonl");
+        let answer = serde_json::json!({
+            "findings": [{
+                "title": "[P2] Проверить резервный формат",
+                "body": "Ответ пришёл через output_text."
+            }],
+            "overall_explanation": "Есть замечание."
+        })
+        .to_string();
+        let response_item = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": answer.clone()}]
+            }
+        });
+        let task_complete = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-response-item",
+                "last_agent_message": null
+            }
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                review_meta("review-response-item"),
+                response_item,
+                task_complete
+            ),
+        )
+        .expect("review");
+
+        let mut watcher = ReviewWatcher::load(
+            directory.path().join("sessions"),
+            directory.path().join("state.json"),
+        )
+        .expect("watcher");
+        let pending = watcher.scan_once(false).expect("scan response item");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].findings, Some(1));
+        assert_eq!(
+            pending[0].finding_details[0].title.as_deref(),
+            Some("[P2] Проверить резервный формат")
+        );
+        assert_eq!(pending[0].explanation.as_deref(), Some("Есть замечание."));
+
+        let mut state = SessionFileState {
+            is_review: true,
+            review_id: Some("review-agent-message".to_string()),
+            ..SessionFileState::default()
+        };
+        apply_record(
+            &mut state,
+            serde_json::from_value(serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": answer}
+            }))
+            .expect("agent message record"),
+        );
+        apply_record(
+            &mut state,
+            serde_json::from_value(serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-agent-message"}
+            }))
+            .expect("task complete record"),
+        );
+        let completion = state.completion.expect("agent message completion");
+        assert_eq!(completion.findings, Some(1));
+        assert_eq!(
+            completion.finding_details[0].body.as_deref(),
+            Some("Ответ пришёл через output_text.")
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use crate::hook::HookPayload;
 use std::path::Path;
 
-const UNKNOWN_PROJECT: &str = "неизвестный проект";
-const EMPTY_MESSAGE: &str = "Codex завершил выполнение без итогового сообщения.";
+const UNKNOWN_PROJECT: &str = "Проект не определён";
+const EMPTY_MESSAGE: &str = "Codex завершил выполнение, но итоговое сообщение не получено.";
 const TRUNCATION_SUFFIX: &str = "\n…\n\n[сообщение сокращено]";
 
 pub fn build_notification(payload: &HookPayload, max_length: usize) -> String {
@@ -28,7 +28,7 @@ pub fn build_notification(payload: &HookPayload, max_length: usize) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(EMPTY_MESSAGE);
 
-    let mut output = format!("✅ Codex завершил turn\n\n📁 {project}\n");
+    let mut output = format!("✅ Codex завершил выполнение\n\n📁 {project}\n");
     if let Some(model) = model {
         output.push_str(&format!("🤖 {model}"));
         if let Some(effort) = effort {
@@ -49,13 +49,33 @@ pub fn build_review_notification(
     explanation: Option<&str>,
     max_length: usize,
 ) -> String {
+    build_review_notification_with_findings(
+        cwd,
+        model,
+        effort,
+        findings,
+        None,
+        explanation,
+        max_length,
+    )
+}
+
+pub fn build_review_notification_with_findings(
+    cwd: Option<&Path>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    findings: Option<usize>,
+    finding_details: Option<&str>,
+    explanation: Option<&str>,
+    max_length: usize,
+) -> String {
     let project = cwd
         .and_then(project_name)
         .unwrap_or_else(|| UNKNOWN_PROJECT.to_string());
     let model = model.map(str::trim).filter(|value| !value.is_empty());
     let effort = effort.map(str::trim).filter(|value| !value.is_empty());
 
-    let mut output = format!("🔎 Codex завершил review\n\n📁 {project}\n");
+    let mut output = format!("🔎 Проверка изменений завершена\n\n📁 {project}\n");
     if let Some(model) = model {
         output.push_str(&format!("🤖 {model}"));
         if let Some(effort) = effort {
@@ -65,12 +85,23 @@ pub fn build_review_notification(
     }
 
     match findings {
-        Some(0) => output.push_str("\n✅ Замечаний не найдено."),
-        Some(count) => output.push_str(&format!("\n⚠️ Найдено замечаний: {count}.")),
-        None => output.push_str("\n✅ Результат ревью получен."),
+        Some(0) => output.push_str("\n✅ Проблем не найдено."),
+        Some(count) => output.push_str(&format!("\n⚠️ Найдено проблем: {count}.")),
+        None => output.push_str("\n✅ Результат проверки получен."),
+    }
+    let finding_details = finding_details
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(finding_details) = finding_details {
+        output.push_str("\n\n⚠️ Проблемы:\n\n");
+        output.push_str(finding_details);
     }
     if let Some(explanation) = explanation.map(str::trim).filter(|value| !value.is_empty()) {
-        output.push_str("\n\n");
+        if finding_details.is_some() {
+            output.push_str("\n\n📝 Итог:\n\n");
+        } else {
+            output.push_str("\n\n");
+        }
         output.push_str(explanation);
     }
 
@@ -137,10 +168,30 @@ mod tests {
             Some("Изменения выглядят корректно."),
             3500,
         );
-        assert!(result.contains("завершил review"));
+        assert!(result.contains("Проверка изменений завершена"));
         assert!(result.contains("🤖 gpt-5.6-luna (max)"));
-        assert!(result.contains("Замечаний не найдено"));
+        assert!(result.contains("Проблем не найдено"));
         assert!(result.contains("Изменения выглядят корректно"));
+    }
+
+    #[test]
+    fn formats_review_findings_before_overall_explanation() {
+        let result = build_review_notification_with_findings(
+            Some(Path::new("/home/user/project")),
+            None,
+            None,
+            Some(1),
+            Some("1. [P1] Исправить обработку ответа\nПроблема описана здесь."),
+            Some("Патч требует доработки."),
+            3500,
+        );
+        assert!(result.contains("Проблемы:"));
+        assert!(result.contains("Проблема описана здесь."));
+        assert!(result.contains("Итог:"));
+        assert!(
+            result.find("Проблема описана здесь.").unwrap()
+                < result.find("Патч требует доработки.").unwrap()
+        );
     }
 
     #[test]
@@ -151,7 +202,7 @@ mod tests {
         payload.effort = None;
         payload.last_assistant_message = Some("  \n ".to_string());
         let result = build_notification(&payload, 3500);
-        assert!(result.contains("📁 неизвестный проект"));
+        assert!(result.contains("📁 Проект не определён"));
         assert!(!result.contains("🤖"));
         assert!(result.contains(EMPTY_MESSAGE));
     }
