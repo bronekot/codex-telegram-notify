@@ -208,11 +208,11 @@ pub async fn notify_payload_with_api(
     api: &dyn TelegramApi,
 ) -> Result<(), AppError> {
     let text = build_notification(payload, config.max_length);
-    api.send_message(SendMessageRequest {
-        chat_id: config.chat_id,
+    api.send_message(SendMessageRequest::html(
+        config.chat_id,
         text,
-        disable_notification: config.silent,
-    })
+        config.silent,
+    ))
     .await
     .map_err(|error| AppError::Telegram(error.user_message()))
 }
@@ -284,7 +284,7 @@ mod tests {
             turn_id: Some("turn".to_string()),
             agent_id: None,
             agent_type: None,
-            last_assistant_message: Some("Готово ✅".to_string()),
+            last_assistant_message: Some("**Готово** ✅\n\nПроверено: `a < b`.".to_string()),
         };
 
         notify_payload_with_api(&payload, &config(), &api)
@@ -293,7 +293,12 @@ mod tests {
         let request = request.lock().expect("lock").clone().expect("request");
         assert_eq!(request.chat_id, -100);
         assert!(request.text.contains("my-project"));
-        assert!(request.text.contains("Готово ✅"));
+        assert!(request.text.contains("<b>Готово</b> ✅"));
+        assert!(request.text.contains("<code>a &lt; b</code>"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["parse_mode"],
+            "HTML"
+        );
         assert!(request.disable_notification);
     }
 

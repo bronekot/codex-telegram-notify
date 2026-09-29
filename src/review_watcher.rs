@@ -1,6 +1,7 @@
 use crate::config::{ConfigStore, RuntimeConfig};
 use crate::error::AppError;
-use crate::message::{build_review_notification, truncate_unicode};
+use crate::markdown::escape_markdown;
+use crate::message::{build_review_notification, parse_json_answer};
 use crate::paths::codex_home;
 use crate::telegram::{HttpTelegramApi, SendMessageRequest, TelegramApi};
 use fs2::FileExt;
@@ -336,11 +337,11 @@ async fn notify_review_with_api(
             config.max_length,
         )
     };
-    api.send_message(SendMessageRequest {
-        chat_id: config.chat_id,
+    api.send_message(SendMessageRequest::html(
+        config.chat_id,
         text,
-        disable_notification: config.silent,
-    })
+        config.silent,
+    ))
     .await
     .map_err(|error| AppError::Telegram(error.user_message()))
 }
@@ -459,54 +460,12 @@ fn summarize_review(message: Option<&str>) -> (Option<usize>, Vec<ReviewFinding>
         return (None, Vec::new(), None);
     }
 
-    if looks_like_json(message) {
-        return (None, Vec::new(), None);
-    }
-    (None, Vec::new(), Some(truncate_unicode(message, 1000)))
+    (None, Vec::new(), Some(message.to_string()))
 }
 
 fn normalize_explanation(value: String) -> Option<String> {
     let value = value.trim().to_string();
-    (!value.is_empty()).then(|| truncate_unicode(&value, 1000))
-}
-
-fn parse_json_answer(message: &str) -> Option<Value> {
-    let candidates = [
-        message,
-        message
-            .strip_prefix("```json")
-            .and_then(|value| value.strip_suffix("```"))
-            .map(str::trim)
-            .unwrap_or(message),
-    ];
-
-    for candidate in candidates {
-        if let Ok(value) = serde_json::from_str::<Value>(candidate) {
-            return Some(value);
-        }
-    }
-
-    for (opening, closing) in [(b'{', b'}'), (b'[', b']')] {
-        let Some(start) = message.as_bytes().iter().position(|byte| *byte == opening) else {
-            continue;
-        };
-        let Some(end) = message.as_bytes().iter().rposition(|byte| *byte == closing) else {
-            continue;
-        };
-        if start <= end {
-            if let Ok(value) = serde_json::from_str::<Value>(&message[start..=end]) {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
-fn looks_like_json(message: &str) -> bool {
-    message.starts_with('{')
-        || message.starts_with('[')
-        || message.starts_with("```json")
-        || message.starts_with("```")
+    (!value.is_empty()).then_some(value)
 }
 
 fn value_to_message(value: &Value) -> Option<String> {
@@ -601,21 +560,21 @@ fn format_review_findings(findings: &[ReviewFinding]) -> Option<String> {
         if index > 0 {
             output.push_str("\n\n");
         }
-        output.push_str(&format!("{}. ", index + 1));
-        if finding.title.is_none() {
-            if let Some(priority) = finding.priority {
-                output.push_str(&format!("[P{priority}] "));
+        let mut label = finding.title.as_deref().unwrap_or("Замечание").to_string();
+        if let Some(priority) = finding.priority {
+            if !label.starts_with("[P") {
+                label = format!("[P{priority}] {label}");
             }
         }
-        output.push_str(finding.title.as_deref().unwrap_or("Замечание"));
+        output.push_str(&format!("**{}. {}**", index + 1, escape_markdown(&label)));
         if let Some(body) = finding.body.as_deref() {
-            output.push('\n');
+            output.push_str("\n\n");
             output.push_str(body);
         }
         if let Some(location) = finding.code_location.as_ref() {
             if let Some(path) = location.absolute_file_path.as_deref() {
-                output.push_str("\n📍 ");
-                output.push_str(path);
+                output.push_str("\n\n📍 ");
+                output.push_str(&escape_markdown(path));
                 if let Some(start) = location.start_line {
                     output.push_str(&format!(":{start}"));
                     if location.end_line.is_some_and(|end| end != start) {
@@ -1158,12 +1117,11 @@ mod tests {
             details[0].body.as_deref(),
             Some("Тело проблемы должно попасть в уведомление.")
         );
-        assert_eq!(
-            format_review_findings(&details).as_deref(),
-            Some(
-                "1. [P1] Исправить разбор ответа\nТело проблемы должно попасть в уведомление.\n📍 /home/user/project/src/lib.rs:12-14"
-            )
-        );
+        let formatted = format_review_findings(&details).expect("formatted findings");
+        let rendered = crate::markdown::render_markdown(&formatted, 4000);
+        assert!(rendered.contains("<b>1. [P1] Исправить разбор ответа</b>"));
+        assert!(rendered.contains("Тело проблемы должно попасть в уведомление."));
+        assert!(rendered.contains("📍 /home/user/project/src/lib.rs:12-14"));
         assert_eq!(explanation.as_deref(), Some("Патч требует доработки."));
 
         let fenced = format!("```json\n{message}\n```");
@@ -1176,6 +1134,65 @@ mod tests {
             plain_answer.as_deref(),
             Some("Проверка завершена без JSON.")
         );
+    }
+
+    #[test]
+    fn preserves_markdown_reviews_and_embedded_json_examples() {
+        for message in [
+            "[Документация](https://example.com)\n\n**Проверено** без замечаний.",
+            "```rust\nlet value = {\"answer\": \"не итог\"};\n```",
+            "```python\n{\"answer\": \"не итог\"}\n```",
+            "Сбой при таком ответе:\n\n```json\n{\"message\": \"пример\"}\n```\n\nИсправьте обработку.",
+            "Ответ `{\"message\": \"пример\"}` вызывает ошибку.",
+            "[P1] Исправьте обработку **ошибки**.",
+        ] {
+            let (count, details, explanation) = summarize_review(Some(message));
+            assert_eq!(count, None, "{message}");
+            assert!(details.is_empty(), "{message}");
+            assert_eq!(explanation.as_deref(), Some(message));
+        }
+    }
+
+    #[test]
+    fn preserves_complete_markdown_until_notification_rendering() {
+        let body = format!("```text\n{}\n```\n\n**Конец**", "строка\n".repeat(250));
+        let (_, _, plain) = summarize_review(Some(&body));
+        assert_eq!(plain.as_deref(), Some(body.as_str()));
+
+        let message = serde_json::json!({
+            "findings": [{"title": "Длинный пример", "body": body}],
+            "overall_explanation": body,
+        })
+        .to_string();
+        let (_, details, explanation) = summarize_review(Some(&message));
+        assert_eq!(details[0].body.as_deref(), Some(body.as_str()));
+        assert_eq!(explanation.as_deref(), Some(body.as_str()));
+    }
+
+    #[test]
+    fn formats_literal_metadata_and_markdown_finding_body() {
+        let message = serde_json::json!({
+            "findings": [{
+                "title": "Проверьте *имя* и <tag>",
+                "priority": 2,
+                "body": "**Ошибка** в `parse()`.\n\n```rust\nfoo::<T>();\n```",
+                "code_location": {
+                    "absolute_file_path": "/tmp/a_b/*file*.rs",
+                    "line_range": {"start": 12, "end": 14}
+                }
+            }]
+        })
+        .to_string();
+        let (_, details, _) = summarize_review(Some(&message));
+        let formatted = format_review_findings(&details).expect("formatted findings");
+        let rendered = crate::markdown::render_markdown(&formatted, 4000);
+        assert!(rendered.contains("<b>1. [P2] Проверьте *имя* и &lt;tag&gt;</b>"));
+        assert!(rendered.contains("<b>Ошибка</b>"));
+        assert!(rendered.contains("<code>parse()</code>"));
+        assert!(rendered.contains("foo::&lt;T&gt;();"));
+        assert!(rendered.contains("📍 /tmp/a_b/*file*.rs:12-14"));
+        assert!(!rendered.contains("<i>имя</i>"));
+        assert!(!rendered.contains("<i>file</i>"));
     }
 
     #[test]

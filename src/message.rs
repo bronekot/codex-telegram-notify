@@ -1,10 +1,10 @@
 use crate::hook::HookPayload;
+use crate::markdown::{escape_markdown, render_markdown};
 use serde_json::Value;
 use std::path::Path;
 
 const UNKNOWN_PROJECT: &str = "Проект не определён";
-const EMPTY_MESSAGE: &str = "Codex завершил выполнение, но итоговое сообщение не получено.";
-const TRUNCATION_SUFFIX: &str = "\n…\n\n[сообщение сокращено]";
+const EMPTY_MESSAGE: &str = "Итоговый ответ не получен.";
 const ANSWER_KEYS: &[&str] = &[
     "answer",
     "response",
@@ -43,17 +43,29 @@ pub fn build_notification(payload: &HookPayload, max_length: usize) -> String {
         .and_then(extract_assistant_answer)
         .unwrap_or_else(|| EMPTY_MESSAGE.to_string());
 
-    let mut output = format!("✅ Codex завершил выполнение\n\n📁 {project}\n");
-    if let Some(model) = model {
-        output.push_str(&format!("🤖 {model}"));
-        if let Some(effort) = effort {
-            output.push_str(&format!(" ({effort})"));
-        }
-        output.push('\n');
-    }
-    output.push_str(&format!("\n{message}"));
+    let mut output = notification_header("✅ **Codex · готово**", &project, model, effort);
+    output.push_str(&format!("\n\n{message}"));
 
-    truncate_unicode(&output, max_length)
+    render_markdown(&output, max_length)
+}
+
+fn notification_header(
+    title: &str,
+    project: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> String {
+    let mut output = format!("{title}\n📁 {}", escape_markdown(project));
+    let metadata = [model, effort]
+        .into_iter()
+        .flatten()
+        .map(escape_markdown)
+        .collect::<Vec<_>>();
+    if !metadata.is_empty() {
+        output.push('\n');
+        output.push_str(&metadata.join(" · "));
+    }
+    output
 }
 
 fn extract_assistant_answer(message: &str) -> Option<String> {
@@ -71,44 +83,21 @@ fn extract_assistant_answer(message: &str) -> Option<String> {
     format_json_answer(&value)
 }
 
-fn parse_json_answer(message: &str) -> Option<Value> {
+pub(crate) fn parse_json_answer(message: &str) -> Option<Value> {
     let message = message.trim();
-    let mut candidates = vec![message];
-    if let Some(fenced) = fenced_json_body(message) {
-        candidates.push(fenced);
-    }
-
-    for candidate in candidates {
-        if let Ok(value) = serde_json::from_str::<Value>(candidate) {
-            return Some(value);
-        }
-    }
-
-    for (opening, closing) in [(b'{', b'}'), (b'[', b']')] {
-        let Some(start) = message.as_bytes().iter().position(|byte| *byte == opening) else {
-            continue;
-        };
-        let Some(end) = message.as_bytes().iter().rposition(|byte| *byte == closing) else {
-            continue;
-        };
-        if start <= end {
-            if let Ok(value) = serde_json::from_str::<Value>(&message[start..=end]) {
-                return Some(value);
-            }
-        }
-    }
-    None
+    serde_json::from_str(message)
+        .ok()
+        .or_else(|| fenced_json_body(message).and_then(|body| serde_json::from_str(body).ok()))
 }
 
 fn fenced_json_body(message: &str) -> Option<&str> {
-    let message = message.trim();
-    let body = message.strip_prefix("```")?.strip_suffix("```")?.trim();
-    if let Some((language, contents)) = body.split_once('\n') {
-        if language.trim().eq_ignore_ascii_case("json") {
-            return Some(contents.trim());
-        }
+    let (opening, rest) = message.split_once('\n')?;
+    let language = opening.trim().strip_prefix("```")?.trim();
+    if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+        return None;
     }
-    Some(body.strip_prefix("json").map(str::trim).unwrap_or(body))
+    let (body, closing) = rest.rsplit_once('\n')?;
+    (closing.trim() == "```").then_some(body.trim())
 }
 
 fn format_json_answer(value: &Value) -> Option<String> {
@@ -219,16 +208,16 @@ fn format_json_review_answer(object: &serde_json::Map<String, Value>) -> Option<
     let mut sections = Vec::new();
     if let Some(findings) = findings {
         if findings.is_empty() {
-            sections.push("✅ Проблем не найдено.".to_string());
+            sections.push("✅ Замечаний нет".to_string());
         } else {
             let details = findings
                 .iter()
                 .enumerate()
                 .filter_map(|(index, value)| format_json_finding(value, index))
                 .collect::<Vec<_>>();
-            let mut section = format!("⚠️ Найдено проблем: {}.", findings.len());
+            let mut section = format!("⚠️ Замечаний: {}", findings.len());
             if !details.is_empty() {
-                section.push_str("\n\nПроблемы:\n\n");
+                section.push_str("\n\n");
                 section.push_str(&details.join("\n\n"));
             }
             sections.push(section);
@@ -236,9 +225,9 @@ fn format_json_review_answer(object: &serde_json::Map<String, Value>) -> Option<
     }
 
     if let Some(explanation) = explanation {
-        sections.push(format!("📝 Итог:\n\n{explanation}"));
+        sections.push(explanation);
     } else if let Some(correctness) = correctness {
-        sections.push(format!("📝 Итог: {correctness}"));
+        sections.push(correctness);
     }
 
     (!sections.is_empty()).then(|| sections.join("\n\n"))
@@ -277,14 +266,14 @@ fn format_json_finding(value: &Value, index: usize) -> Option<String> {
         }
     }
 
-    let mut output = format!("{}. {label}", index + 1);
+    let mut output = format!("**{}. {}**", index + 1, escape_markdown(&label));
     if let Some(body) = body {
-        output.push('\n');
+        output.push_str("\n\n");
         output.push_str(&body);
     }
     if let Some(location) = location {
-        output.push_str("\n📍 ");
-        output.push_str(&location);
+        output.push_str("\n\n📍 ");
+        output.push_str(&escape_markdown(&location));
     }
     Some(output)
 }
@@ -373,60 +362,32 @@ pub fn build_review_notification_with_findings(
     let model = model.map(str::trim).filter(|value| !value.is_empty());
     let effort = effort.map(str::trim).filter(|value| !value.is_empty());
 
-    let mut output = format!("🔎 Проверка изменений завершена\n\n📁 {project}\n");
-    if let Some(model) = model {
-        output.push_str(&format!("🤖 {model}"));
-        if let Some(effort) = effort {
-            output.push_str(&format!(" ({effort})"));
-        }
-        output.push('\n');
-    }
+    let mut output = notification_header("🔎 **Проверка завершена**", &project, model, effort);
 
     match findings {
-        Some(0) => output.push_str("\n✅ Проблем не найдено."),
-        Some(count) => output.push_str(&format!("\n⚠️ Найдено проблем: {count}.")),
-        None => output.push_str("\n✅ Результат проверки получен."),
+        Some(0) => output.push_str("\n\n✅ Замечаний нет"),
+        Some(count) => output.push_str(&format!("\n\n⚠️ Замечаний: {count}")),
+        None => {}
     }
     let finding_details = finding_details
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if let Some(finding_details) = finding_details {
-        output.push_str("\n\n⚠️ Проблемы:\n\n");
+        output.push_str("\n\n");
         output.push_str(finding_details);
     }
     if let Some(explanation) = explanation.map(str::trim).filter(|value| !value.is_empty()) {
-        if finding_details.is_some() {
-            output.push_str("\n\n📝 Итог:\n\n");
-        } else {
-            output.push_str("\n\n");
-        }
+        output.push_str("\n\n");
         output.push_str(explanation);
     }
 
-    truncate_unicode(&output, max_length)
+    render_markdown(&output, max_length)
 }
 
 fn project_name(path: &Path) -> Option<String> {
     path.file_name()
         .map(|name| name.to_string_lossy().trim().to_string())
         .filter(|name| !name.is_empty())
-}
-
-pub fn truncate_unicode(value: &str, max_length: usize) -> String {
-    let length = value.chars().count();
-    if length <= max_length {
-        return value.to_string();
-    }
-
-    let suffix_length = TRUNCATION_SUFFIX.chars().count();
-    if max_length <= suffix_length {
-        return value.chars().take(max_length).collect();
-    }
-
-    let prefix_length = max_length - suffix_length;
-    let mut output: String = value.chars().take(prefix_length).collect();
-    output.push_str(TRUNCATION_SUFFIX);
-    output
 }
 
 #[cfg(test)]
@@ -451,9 +412,10 @@ mod tests {
     #[test]
     fn formats_project_model_and_unicode_message() {
         let result = build_notification(&payload(), 3500);
-        assert!(result.contains("📁 моя-папка"));
-        assert!(result.contains("🤖 gpt-5.6-sol (high)"));
-        assert!(result.contains("Готово 🚀"));
+        assert_eq!(
+            result,
+            "✅ <b>Codex · готово</b>\n📁 моя-папка\ngpt-5.6-sol · high\n\nГотово 🚀"
+        );
     }
 
     #[test]
@@ -476,7 +438,8 @@ mod tests {
         );
 
         let result = build_notification(&payload, 3500);
-        assert!(result.contains("Проблемы:"));
+        assert!(result.contains("⚠️ Замечаний: 1"));
+        assert!(result.contains("<b>1. [P2] Исправить обработку ответа</b>"));
         assert!(result.contains("[P2] Исправить обработку ответа"));
         assert!(result.contains("Тело проблемы должно попасть в уведомление."));
         assert!(result.contains("📍 /home/user/project/src/lib.rs:12-14"));
@@ -525,10 +488,10 @@ mod tests {
             Some("Изменения выглядят корректно."),
             3500,
         );
-        assert!(result.contains("Проверка изменений завершена"));
-        assert!(result.contains("🤖 gpt-5.6-luna (max)"));
-        assert!(result.contains("Проблем не найдено"));
-        assert!(result.contains("Изменения выглядят корректно"));
+        assert_eq!(
+            result,
+            "🔎 <b>Проверка завершена</b>\n📁 project\ngpt-5.6-luna · max\n\n✅ Замечаний нет\n\nИзменения выглядят корректно."
+        );
     }
 
     #[test]
@@ -542,9 +505,10 @@ mod tests {
             Some("Патч требует доработки."),
             3500,
         );
-        assert!(result.contains("Проблемы:"));
+        assert!(result.contains("⚠️ Замечаний: 1"));
         assert!(result.contains("Проблема описана здесь."));
-        assert!(result.contains("Итог:"));
+        assert!(!result.contains("Проблемы:"));
+        assert!(!result.contains("Итог:"));
         assert!(
             result.find("Проблема описана здесь.").unwrap()
                 < result.find("Патч требует доработки.").unwrap()
@@ -565,19 +529,74 @@ mod tests {
     }
 
     #[test]
-    fn truncates_without_splitting_unicode() {
-        let result = truncate_unicode("Привет 🚀 мир", 8);
-        assert_eq!(result.chars().count(), 8);
-        assert!(result.is_char_boundary(result.len()));
+    fn preserves_effort_without_a_model() {
+        let mut payload = payload();
+        payload.model = None;
+        let result = build_notification(&payload, 3500);
+        assert!(result.contains("📁 моя-папка\nhigh\n\n"));
+
+        let result = build_review_notification(None, None, Some(" high "), Some(0), None, 3500);
+        assert!(result.contains("📁 Проект не определён\nhigh\n\n"));
     }
 
     #[test]
-    fn adds_truncation_marker_when_it_fits() {
-        let result = truncate_unicode("0123456789", 40);
-        assert_eq!(result, "0123456789");
+    fn renders_assistant_markdown_and_keeps_metadata_literal() {
+        let mut payload = payload();
+        payload.cwd = Some(PathBuf::from("/home/user/*project* & <local>"));
+        payload.model = Some("**model**".to_string());
+        payload.effort = Some("[high](https://example.com)".to_string());
+        payload.last_assistant_message =
+            Some("**Готово**: `a < b`\n\n[Изменения](https://example.com/changes)".to_string());
+        let result = build_notification(&payload, 3500);
+        assert!(result.contains("📁 *project* &amp; &lt;local&gt;"));
+        assert!(result.contains("**model** · [high](https://example.com)"));
+        assert!(result.contains("<b>Готово</b>: <code>a &lt; b</code>"));
+        assert!(result.contains("<a href=\"https://example.com/changes\">Изменения</a>"));
+    }
 
-        let result = truncate_unicode(&"x".repeat(100), 40);
-        assert!(result.ends_with("[сообщение сокращено]"));
-        assert_eq!(result.chars().count(), 40);
+    #[test]
+    fn keeps_json_examples_inside_markdown_answers() {
+        let messages = [
+            "Сохраните конфигурацию:\n\n```json\n{\"answer\":\"value\"}\n```\n\nЗатем перезапустите.",
+            "```javascript\n{\"answer\":\"value\"}\n```",
+            "Пример: {\"answer\":\"value\"} — это объект.",
+        ];
+        for message in messages {
+            assert_eq!(extract_assistant_answer(message).as_deref(), Some(message));
+        }
+    }
+
+    #[test]
+    fn escapes_json_finding_metadata_and_renders_body_markdown() {
+        let mut payload = payload();
+        payload.last_assistant_message = Some(
+            serde_json::json!({
+                "findings": [{
+                    "title": "Исправить *значение* <id>",
+                    "body": "Проверьте **условие**.\n\n```rust\nif a < b {}\n```",
+                    "priority": 1,
+                    "code_location": {
+                        "absolute_file_path": "/src/*file*<name>.rs",
+                        "line_range": {"start": 12, "end": 14}
+                    }
+                }]
+            })
+            .to_string(),
+        );
+        let result = build_notification(&payload, 3500);
+        assert!(result.contains("<b>1. [P1] Исправить *значение* &lt;id&gt;</b>"));
+        assert!(result.contains("Проверьте <b>условие</b>."));
+        assert!(result.contains("<pre>"));
+        assert!(result.contains("if a &lt; b {}"));
+        assert!(result.contains("📍 /src/*file*&lt;name&gt;.rs:12-14"));
+    }
+
+    #[test]
+    fn leaves_unknown_review_status_unspecified() {
+        let result =
+            build_review_notification(None, None, None, None, Some("Проверьте ответ."), 3500);
+        assert!(result.contains("Проверьте ответ."));
+        assert!(!result.contains("Замечаний нет"));
+        assert!(!result.contains("Результат проверки получен"));
     }
 }

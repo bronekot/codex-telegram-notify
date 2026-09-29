@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod error;
 mod hook;
+mod markdown;
 mod message;
 mod paths;
 mod review_watcher;
@@ -90,11 +91,14 @@ async fn run_test() -> Result<(), AppError> {
     let runtime = effective.runtime()?;
     let api = telegram::HttpTelegramApi::new(runtime.bot_token.clone(), runtime.timeout)
         .map_err(|error| AppError::Telegram(error.user_message()))?;
-    api.send_message(telegram::SendMessageRequest {
-        chat_id: runtime.chat_id,
-        text: "🧪 Codex Telegram Notify\n\nТестовое уведомление отправлено.".to_string(),
-        disable_notification: runtime.silent,
-    })
+    api.send_message(telegram::SendMessageRequest::html(
+        runtime.chat_id,
+        markdown::render_markdown(
+            "🧪 **Codex · тест**\n\nУведомления работают.",
+            runtime.max_length,
+        ),
+        runtime.silent,
+    ))
     .await
     .map_err(|error| AppError::Telegram(error.user_message()))
 }

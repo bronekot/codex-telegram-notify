@@ -129,11 +129,29 @@ supergroup IDs are supported.
 
 With no command-line arguments, the binary reads the Codex hook JSON from
 stdin. It uses `cwd`, `model`, `effort`, and `last_assistant_message` to produce
-a plain text Telegram message without Markdown or HTML parsing. The assistant
-message may be ordinary text, a JSON string, or a JSON object: the notifier
+a compact notification with the project, model, and final answer. For example:
+
+> ✅ **Codex · готово**<br>
+> 📁 my-project<br>
+> gpt-5.6-sol · high
+>
+> Fixed the bug in `src/main.rs`.
+
+Markdown in assistant answers is supported automatically: bold, italic,
+strikethrough, headings, lists, quotes, links, inline code, and fenced code
+blocks. Headings appear in bold. The notifier converts Markdown to
+[Telegram-compatible HTML](https://core.telegram.org/bots/api#html-style)
+and escapes literal text, including project names and raw HTML. Web and
+Telegram links are clickable; local file links keep their readable labels.
+Unsupported Markdown remains readable text.
+
+The assistant message may be ordinary text, a JSON string, or a JSON object: the notifier
 extracts the answer from common `answer`, `response`, `message`, `text`,
 `output_text`, and `content` envelopes. Review-shaped JSON is formatted with
 its findings and overall explanation instead of being sent as a raw JSON blob.
+JSON extraction applies to complete JSON answers and JSON fences; snippets
+inside a longer Markdown answer are preserved. Review notifications show
+“Замечаний нет” or “Замечаний: N”, followed by findings and the final explanation.
 When the current Codex version does not include `effort` in the hook payload,
 the notifier falls back to `model_reasoning_effort` in
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`). Unknown payload fields
@@ -157,8 +175,11 @@ real hook exit codes are desired:
 3 — Telegram/API/network error
 ```
 
-The default notification length is 3500 Unicode characters and may be set up
-to Telegram's 4096-character text limit.
+The default notification length is 3500 and may be set up to 4096. The limit
+applies to visible text after Markdown rendering, measured conservatively in
+UTF-16 units (most characters count as one, emoji may count as two or more).
+Long notifications end with `…`; truncation preserves valid formatting and
+never splits an HTML entity or Unicode character.
 
 ## Development
 

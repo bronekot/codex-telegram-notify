@@ -109,6 +109,19 @@ pub struct SendMessageRequest {
     pub chat_id: i64,
     pub text: String,
     pub disable_notification: bool,
+    parse_mode: &'static str,
+}
+
+impl SendMessageRequest {
+    /// `text` must be HTML produced by the Markdown renderer.
+    pub fn html(chat_id: i64, text: String, disable_notification: bool) -> Self {
+        Self {
+            chat_id,
+            text,
+            disable_notification,
+            parse_mode: "HTML",
+        }
+    }
 }
 
 #[async_trait]
@@ -351,14 +364,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_message_fields_without_parse_mode() {
+    async fn sends_rendered_markdown_with_html_parse_mode() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/bot123:secret/sendMessage"))
             .and(body_json(serde_json::json!({
                 "chat_id": -100,
-                "text": "hello",
-                "disable_notification": true
+                "text": "<b>Готово</b> &amp; <code>src/main.rs</code>",
+                "disable_notification": true,
+                "parse_mode": "HTML"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
@@ -374,11 +388,11 @@ mod tests {
             server.uri(),
         )
         .expect("client");
-        api.send_message(SendMessageRequest {
-            chat_id: -100,
-            text: "hello".to_string(),
-            disable_notification: true,
-        })
+        api.send_message(SendMessageRequest::html(
+            -100,
+            crate::markdown::render_markdown("**Готово** & `src/main.rs`", 3500),
+            true,
+        ))
         .await
         .expect("sendMessage");
     }

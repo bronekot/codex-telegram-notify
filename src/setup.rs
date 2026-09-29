@@ -13,7 +13,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPDATE_TIMEOUT_SECONDS: u64 = 15;
 const UPDATE_HTTP_TIMEOUT: Duration = Duration::from_secs(25);
 const CHAT_COLLECTION_WINDOW: Duration = Duration::from_secs(2);
-const TEST_MESSAGE: &str = "🧪 Codex Telegram Notify\n\nТестовое уведомление отправлено.";
+const TEST_MESSAGE: &str = "🧪 **Codex · тест**\n\nУведомления работают.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatCandidate {
@@ -120,11 +120,11 @@ pub async fn run_setup_with_api(
 
     let selected = choose_candidate(&candidates, deadline).await?;
     let previous = store.load_file()?;
-    await_api(api.send_message(SendMessageRequest {
-        chat_id: selected.id,
-        text: TEST_MESSAGE.to_string(),
-        disable_notification: previous.silent,
-    }))
+    await_api(api.send_message(SendMessageRequest::html(
+        selected.id,
+        crate::markdown::render_markdown(TEST_MESSAGE, previous.max_length),
+        previous.silent,
+    )))
     .await?;
     println!("✓ Тестовое уведомление отправлено");
 
