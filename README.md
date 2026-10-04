@@ -151,6 +151,12 @@ notifier falls back to `model_reasoning_effort` in
 `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`). Unknown payload fields
 are ignored.
 
+Turn and review notifications show the original project folder for Git
+worktrees, using the worktree's Git metadata. Managed `codex-fixloop`
+worktrees also retain the project name after the isolated folder is removed.
+Other working directories keep their folder name; unreadable or unsupported
+Git metadata does not prevent notification delivery.
+
 The hidden `probe-subagent` command is available for diagnosing actual
 `SubagentStop` events. It records only lifecycle metadata (`agent_type`, IDs,
 project, and model) in

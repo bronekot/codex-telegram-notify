@@ -1,5 +1,7 @@
 use crate::hook::HookPayload;
-use std::path::Path;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 const UNKNOWN_PROJECT: &str = "неизвестный проект";
 const EMPTY_MESSAGE: &str = "Codex завершил выполнение без итогового сообщения.";
@@ -78,9 +80,69 @@ pub fn build_review_notification(
 }
 
 fn project_name(path: &Path) -> Option<String> {
-    path.file_name()
+    let root = managed_project_root(path)
+        .map(Path::to_path_buf)
+        .or_else(|| linked_worktree_project_root(path));
+    root.as_deref()
+        .unwrap_or(path)
+        .file_name()
         .map(|name| name.to_string_lossy().trim().to_string())
         .filter(|name| !name.is_empty())
+}
+
+fn managed_project_root(path: &Path) -> Option<&Path> {
+    // Review notifications can arrive after fixloop has removed the worktree.
+    path.ancestors().find_map(|worktree| {
+        let worktrees = worktree.parent()?;
+        if worktrees.file_name()? != "worktrees" {
+            return None;
+        }
+        let fixloop = worktrees.parent()?;
+        if fixloop.file_name()? != "codex-fixloop" {
+            return None;
+        }
+        let git_dir = fixloop.parent()?;
+        if git_dir.file_name()? != ".git" {
+            return None;
+        }
+        git_dir.parent()
+    })
+}
+
+fn linked_worktree_project_root(path: &Path) -> Option<PathBuf> {
+    for directory in path.ancestors() {
+        let git_file = directory.join(".git");
+        if git_file.is_dir() {
+            // A normal checkout marks the nearest repository boundary.
+            return None;
+        }
+        if !git_file.is_file() {
+            continue;
+        }
+        let git_dir = directory.join(read_git_path(&git_file, "gitdir:")?);
+        let common_dir = git_dir.join(read_git_path(&git_dir.join("commondir"), "")?);
+        let common_dir = common_dir.canonicalize().ok()?;
+        if common_dir.file_name()? != ".git" {
+            return None;
+        }
+        return common_dir.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+fn read_git_path(path: &Path, prefix: &str) -> Option<PathBuf> {
+    const MAX_METADATA_BYTES: u64 = 8192;
+    let mut contents = String::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_METADATA_BYTES + 1)
+        .read_to_string(&mut contents)
+        .ok()?;
+    if contents.len() > MAX_METADATA_BYTES as usize {
+        return None;
+    }
+    let value = contents.trim().strip_prefix(prefix)?.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
 }
 
 pub fn truncate_unicode(value: &str, max_length: usize) -> String {
@@ -141,6 +203,77 @@ mod tests {
         assert!(result.contains("🤖 gpt-5.6-luna (max)"));
         assert!(result.contains("Замечаний не найдено"));
         assert!(result.contains("Изменения выглядят корректно"));
+    }
+
+    fn assert_notification_project(cwd: &Path, expected: &str) {
+        let mut payload = payload();
+        payload.cwd = Some(cwd.to_path_buf());
+        let expected_line = format!("📁 {expected}\n");
+        assert!(build_notification(&payload, 3500).contains(&expected_line));
+        assert!(
+            build_review_notification(Some(cwd), None, None, Some(0), None, 3500)
+                .contains(&expected_line)
+        );
+    }
+
+    #[test]
+    fn managed_worktree_notifications_keep_project_after_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("мой проект");
+        let worktree = project.join(".git/codex-fixloop/worktrees/123-456");
+        assert!(!worktree.exists());
+        assert_notification_project(&worktree, "мой проект");
+        assert_notification_project(&worktree.join("src"), "мой проект");
+    }
+
+    #[test]
+    fn linked_worktree_notifications_resolve_absolute_and_relative_git_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("мой проект");
+        let git_dir = project.join(".git/worktrees/review");
+        let worktree = temp.path().join("123-456");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        for target in [
+            git_dir,
+            PathBuf::from("../мой проект/.git/worktrees/review"),
+        ] {
+            std::fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", target.display()),
+            )
+            .unwrap();
+            assert_notification_project(&worktree, "мой проект");
+            assert_notification_project(&worktree.join("src"), "мой проект");
+        }
+    }
+
+    #[test]
+    fn invalid_worktree_metadata_keeps_original_folder_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("work-folder");
+        std::fs::create_dir(&worktree).unwrap();
+        for metadata in [
+            "not a git directory".to_string(),
+            "gitdir: missing-directory".to_string(),
+            format!("gitdir: {}", "x".repeat(9000)),
+        ] {
+            std::fs::write(worktree.join(".git"), metadata).unwrap();
+            assert_notification_project(&worktree, "work-folder");
+        }
+    }
+
+    #[test]
+    fn only_the_full_managed_layout_identifies_a_project() {
+        for cwd in [
+            "/projects/example/.git/other/worktrees/123-456",
+            "/projects/example/codex-fixloop/worktrees/123-456",
+            "/projects/example/.git/codex-fixloop/123-456",
+        ] {
+            assert_notification_project(Path::new(cwd), "123-456");
+        }
     }
 
     #[test]
